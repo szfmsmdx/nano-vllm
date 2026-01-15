@@ -20,13 +20,15 @@ class LLMEngine:
         config = Config(model, **config_kwargs)
         self.ps = []
         self.events = []
+        # CUDA 强制要求 -> spawn 启动方法会创建完全干净的新py解释器，确保每个进程能够独立、安全初始化CUDA环境
         ctx = mp.get_context("spawn")
         for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
+            event = ctx.Event() # 子进程同步事件对象
+            process = ctx.Process(target=ModelRunner, args=(config, i, event))  # 创建子进程，target是进程启动后的类或函数
+            process.start() # 启动子进程
+            
+            self.ps.append(process) # 方便后续的进程管理
+            self.events.append(event)   # 用于主进程和子进程间的通信
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id

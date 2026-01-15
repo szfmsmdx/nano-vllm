@@ -16,9 +16,9 @@ def load_model(model: nn.Module, path: str):
             for weight_name in f.keys():
                 for k in packed_modules_mapping:
                     if k in weight_name:
-                        v, shard_id = packed_modules_mapping[k]
-                        param_name = weight_name.replace(k, v)
-                        param = model.get_parameter(param_name)
+                        v, shard_id = packed_modules_mapping[k] # 取出比如 v, shard_id : "qkv_proj", "q"
+                        param_name = weight_name.replace(k, v)  # 替换原始name : model.layers.0.self_attn.qkv_proj.weight
+                        param = model.get_parameter(param_name) # model 是自己的，取出来 safatensor 的权重放到它定义的 qkv 这个大矩阵中
                         weight_loader = getattr(param, "weight_loader")
                         weight_loader(param, f.get_tensor(weight_name), shard_id)
                         break

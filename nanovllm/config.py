@@ -17,7 +17,8 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
 
-    def __post_init__(self):
+    # @dataclass 后自动执行
+    def __post_init__(self):    
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
