@@ -23,6 +23,7 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        # 初始化逻辑是同步的，当 world size个进程连接到这个 group 队列中才会返回
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)  # 分布式训练组
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -33,18 +34,18 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager:
+        if not self.enforce_eager:      # True 则走普通 torch 代码
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
-            if rank == 0:
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
-                dist.barrier()
+            if rank == 0:   # 主进程逻辑
+                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)   # 1MB
+                dist.barrier()  # 等待所有的分布式进程都到达 barrier，一种同步操作
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")
+                self.shm = SharedMemory(name="nanovllm")    # 连接主进程的 sharemem
                 self.loop()
 
     def exit(self):
@@ -98,17 +99,29 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
+        """
+        分配当前Runner所处device的kvcache
+        """
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
+        # 获取当前的device
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        # self.world_size = config.tensor_parallel_size 有几块 GPU
+        # hf_config.num_key_value_heads : 有多少个头
+        # num_kv_heads 每个卡负责多少个 kv heads
         num_kv_heads = hf_config.num_key_value_heads // self.world_size # 一共的 kv head 个数 / 总 GPU 数量，代表当前显卡需要开辟多少个头的数量
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+
+        # 计算一个 block 存放的大小
+        # block_bytes = kv(2) * 层数 * 一个block放多少 token * 多少 kv 头 * 头维度 * 每个维度的数据大小
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        # 计算当前 GPU 需要挂载的 kvcache block
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
+        # 直接占满，这里不用手动指定 dtype 的原因是，在函数调用的外部上下文已经手动做了这个操作了
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():

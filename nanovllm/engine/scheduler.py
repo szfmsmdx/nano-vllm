@@ -8,11 +8,12 @@ from nanovllm.engine.block_manager import BlockManager
 class Scheduler:
 
     def __init__(self, config: Config):
-        self.max_num_seqs = config.max_num_seqs
-        self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_num_seqs = config.max_num_seqs # 最长 decode 长度
+        self.max_num_batched_tokens = config.max_num_batched_tokens # prefill 塞进去的最大长度
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
-        self.waiting: deque[Sequence] = deque()
+        # continues batching基础实现
+        self.waiting: deque[Sequence] = deque() 
         self.running: deque[Sequence] = deque()
 
     def is_finished(self):
@@ -26,15 +27,19 @@ class Scheduler:
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:
+        while self.waiting and num_seqs < self.max_num_seqs:    # prefill 优先调度
             seq = self.waiting[0]
+            # num_batched_tokens : 本轮积攒的 prefill Token 长度
+            # len(seq) 当前请求 seq 的长度
+            # max_num_batched_tokens 一次性最多多少个
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             num_seqs += 1
             self.block_manager.allocate(seq)
+            # 这个 seq 真正要算的部分
             num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
-            self.waiting.popleft()
+            self.waiting.popleft()  # 取出 prefill 的
             self.running.append(seq)
             scheduled_seqs.append(seq)
         if scheduled_seqs:

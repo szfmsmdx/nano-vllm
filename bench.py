@@ -12,7 +12,7 @@ def main():
     max_ouput_len = 1024
 
     path = os.path.expanduser("/data3/szf_hf/huggingface/model/Qwen2.5-0.5B")
-    llm = LLM(path, enforce_eager=True, max_model_len=4096)
+    llm = LLM(path, enforce_eager=False, max_model_len=4096)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]

@@ -25,7 +25,7 @@ class LLMEngine:
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event() # 子进程同步事件对象
             process = ctx.Process(target=ModelRunner, args=(config, i, event))  # 创建子进程，target是进程启动后的类或函数
-            process.start() # 启动子进程
+            process.start() # 启动子进程，启动完就不管了
             
             self.ps.append(process) # 方便后续的进程管理
             self.events.append(event)   # 用于主进程和子进程间的通信
@@ -33,7 +33,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
-        atexit.register(self.exit)
+        atexit.register(self.exit)  # 注册 exit，不管崩溃还是正常结束都会调用 exit
 
     def exit(self):
         self.model_runner.call("exit")
