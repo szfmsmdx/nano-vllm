@@ -1,5 +1,5 @@
 {
-    "timestamp": "2026-02-11T22:14:32.677233",
+    "timestamp": "2026-02-11T23:12:31.663449",
     "model": "/data3/szf_hf/huggingface/model/Qwen2.5-0.5B",
     "config": {
         "num_seqs": 256,
@@ -11,14 +11,14 @@
         "chunk_size": 128
     },
     "metrics": {
-        "total_time_s": 6.3182,
-        "total_tokens_processed": 450244,
+        "total_time_s": 6.322,
+        "total_tokens_processed": 276537,
         "total_tokens_generated": 133710,
-        "throughput_tok_s": 71261.86,
-        "prefill_throughput_tok_s": 259512.98,
-        "decode_throughput_tok_s": 26267.86,
-        "avg_ttft_ms": 543.31,
-        "p99_ttft_ms": 983.48,
+        "throughput_tok_s": 43742.05,
+        "prefill_throughput_tok_s": 117742.75,
+        "decode_throughput_tok_s": 26213.26,
+        "avg_ttft_ms": 880.02,
+        "p99_ttft_ms": 1214.03,
         "avg_tpot_ms": 0.08,
         "p99_tpot_ms": 0.75
     }

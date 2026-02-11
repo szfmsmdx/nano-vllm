@@ -11,14 +11,6 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
-# 挟持函数，给注入 tp_group 参数
-def get_patched_dist_fn(origin_fn, tp_group):
-    def patched(*args, **kwargs):
-        if 'group' not in kwargs and tp_group is not None:
-            kwargs['group'] = tp_group
-        return  origin_fn(*args, **kwargs)
-    return patched
-
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -33,30 +25,6 @@ class ModelRunner:
         # 初始化逻辑是同步的，当 world size个进程连接到这个 group 队列中才会返回
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)  # 分布式训练组
         torch.cuda.set_device(rank)
-
-        # PD 分离初始化
-        self.tp_group = None
-        self.pd_role = None # 'prefill' / 'decode'
-        self.peer_rank = None # 对应的传输目标/来源
-
-        if config.pd_separation:
-            half_size = self.world_size // 2
-            if rank < half_size:
-                self.pd_role = 'prefill'
-                self.peer_rank = rank + half_size
-            else:
-                self.pd_role = 'decode'
-                self.peer_rank = rank - half_size
-
-            group_prefill = dist.new_group(list(range(0, half_size)))
-            group_decode = dist.new_group(list(range(half_size, self.world_size)))
-
-            self.tp_group = group_prefill if self.pd_role == 'prefill' else group_decode
-            self._patch_distributed_ops()
-        else:
-            self.pd_role = 'None'
-            self.tp_group = None
-
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
@@ -65,12 +33,11 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
-        if not self.enforce_eager and self.pd_role != 'prefill':      # True 则走普通 torch 代码
+        if not self.enforce_eager:      # True 则走普通 torch 代码
             self.capture_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
-        # 进程间通信
         if self.world_size > 1:
             if rank == 0:   # 主进程逻辑
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)   # 1MB
@@ -79,24 +46,6 @@ class ModelRunner:
                 dist.barrier()
                 self.shm = SharedMemory(name="nanovllm")    # 连接主进程的 sharemem
                 self.loop()
-
-    def _patch_distributed_ops(self):
-        """
-        动态替换 dist 操作，使其默认使用子组
-        """
-        if self.tp_group is None:
-            return 
-        
-        self._orig_all_reduce = dist.all_reduce
-        self._orig_get_world_size = dist.get_world_size
-        self._orig_get_rank = dist.get_rank
-
-        # 替换为带 group 版本
-        dist.all_reduce = get_patched_dist_fn(self._orig_all_reduce, self.tp_group)
-        # 返回子组信息
-        dist.get_world_size = lambda group=None: self._orig_get_world_size(self.tp_group) if group is None else self._orig_get_world_size(group)
-        dist.get_rank = lambda group=None: self._orig_get_rank(self.tp_group) if group is None else self._orig_get_rank(group)
-
 
     def exit(self):
         if self.world_size > 1:
@@ -156,65 +105,29 @@ class ModelRunner:
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
+        # 获取当前的device
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-
-        tp_size = dist.get_world_size()
-        num_kv_heads = hf_config.num_key_value_heads // tp_size
+        # self.world_size = config.tensor_parallel_size 有几块 GPU
+        # hf_config.num_key_value_heads : 有多少个头
+        # num_kv_heads 每个卡负责多少个 kv heads
+        num_kv_heads = hf_config.num_key_value_heads // self.world_size # 一共的 kv head 个数 / 总 GPU 数量，代表当前显卡需要开辟多少个头的数量
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
 
-        # block_size：一个block放多少token
+        # 计算一个 block 存放的大小
+        # block_bytes = kv(2) * 层数 * 一个block放多少 token * 多少 kv 头 * 头维度 * 每个维度的数据大小
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - peak - used + current) // block_bytes
+        # 计算当前 GPU 需要挂载的 kvcache block
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-
+        # 直接占满，这里不用手动指定 dtype 的原因是，在函数调用的外部上下文已经手动做了这个操作了
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-
         layer_id = 0
-        for module in self.model.modules:
+        for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
-
-    # P2P 传输 KV Cache
-    def transfer_kv_cache(self, seq_ids: list[int], block_tables_map: dict):
-        """
-        Prefill 节点调用：发送 KV Cache 到对应的 Peer Decode 节点
-        seq_ids: 本轮完成 Prefill 的序列 ID 列表
-        block_tables_map: {seq_id: [block_id1, block_id2...]}
-        """
-        if self.pd_role != 'prefill': return
-        for seq_id in seq_ids:
-            blocks = block_tables_map[seq_id]
-            # 发送元数据
-            meta = torch.tensor([seq_id, len(blocks)], dtype=torch.int32).cuda()
-            dist.send(meta, dst=self.peer_rank)
-
-            # 发送实际数据
-            for layer_idx in range(self.config.hf_config.num_hidden_layers):
-                for block_id in blocks:
-                    k_data = self.kv_cache[0, layer_idx, block_id]
-                    v_data = self.kv_cache[1, layer_idx, block_id]
-                    dist.send(k_data, dst=self.peer_rank)
-                    dist.send(v_data, dst=self.peer_rank)
-
-    def recive_kv_cache(self, num_seqs_to_recv: int)->dict:
-        """
-        Decode 节点调用：从 Peer Prefill 节点接收 KV Cache
-        返回: {seq_id: [new_block_ids]} 映射
-        """
-        if self.pd_role != "decode": return {}
-
-        receive_map = {}
-        for _ in range(num_seqs_to_recv):
-            meta = torch.empty(2, dtype=torch.int32).cuda()
-            dist.recv(meta, src=self.peer_rank)
-            seq_id = meta[0].item()
-            num_blocks = meta[1].item()
-            # 这里 modelrunner 是无法访问 block manager 的，所以需要在外部实现这个功能
-            pass
-        return receive_map
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         # 整理成 2D tensor，需要 padding

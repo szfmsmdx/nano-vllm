@@ -5,6 +5,7 @@ import numpy as np
 from datetime import datetime
 from random import randint, seed
 from nanovllm import LLM, SamplingParams
+from nanovllm.engine.sequence import SequenceStatus
 
 def main():
     seed(0)
@@ -50,7 +51,6 @@ def main():
     decode_tokens = 0
     
     # 跟踪尚未获得 TTFT 的请求
-    # prefill 完就放到 running了，所以可能会有 seq 没有decode但是也在 running 的情况
     pending_ttft = {seq.seq_id for seq in llm.scheduler.waiting} | {seq.seq_id for seq in llm.scheduler.running}
 
     total_start = time.perf_counter()
@@ -59,33 +59,45 @@ def main():
     while not llm.is_finished():
         step_start = time.perf_counter()
         
-        # 为了获取颗粒度指标，我们手动执行 step() 内部逻辑
+        # 1. 调度 (Schedule)
         seqs, is_prefill = llm.scheduler.schedule()
+
+        # [修正 1] 在 postprocess 之前统计本轮真实的 token 数
+        # 必须在这里读，因为 postprocess 会删除 current_chunk_size
+        if is_prefill:
+            # 统计本轮所有 Chunk 的大小之和
+            step_tokens = sum(getattr(seq, "current_chunk_size", 0) for seq in seqs)
+            prefill_tokens += step_tokens
+        else:
+            # Decode 阶段，每个 seq 产出一个 token
+            step_tokens = len(seqs)
+            decode_tokens += step_tokens
+        
+        # 2. 执行 (Run)
         token_ids = llm.model_runner.call("run", seqs, is_prefill)
+        
+        # 3. 后处理 (Postprocess)
+        # 注意：这里会更新 seq.num_cached_tokens 并移除 current_chunk_size
         llm.scheduler.postprocess(seqs, token_ids)
         
         step_end = time.perf_counter()
         step_latency = step_end - step_start
         
+        # [修正 2] 修正 TTFT 统计逻辑
         if is_prefill:
             prefill_time += step_latency
-            # 计算本轮 prefill 处理的 token 总数 (prompt - cached)
-            batch_prefill_tokens = sum(len(seq) - seq.num_cached_tokens for seq in seqs)
-            prefill_tokens += batch_prefill_tokens
-            
-            # 在当前 nano-vllm 实现中，prefill step 完成即意味着首字产生
             for seq in seqs:
-                if seq.seq_id in pending_ttft:
+                # 只有当 seq 在本轮被标记为 RUNNING (说明跑完了最后一个 chunk)
+                # 且它还在 pending 列表中时，才记录 TTFT
+                if seq.seq_id in pending_ttft and seq.status == SequenceStatus.RUNNING:
                     ttfts[seq.seq_id] = step_end - arrival_time
                     pending_ttft.remove(seq.seq_id)
         else:
             decode_time += step_latency
-            decode_tokens += len(seqs) # Decode 阶段每人产出一个 token
-            # TPOT = 这一步的总耗时 / 步内并发请求数
             if len(seqs) > 0:
                 decode_latencies.append(step_latency / len(seqs))
             
-            # 容错：防止某些请求直接跳过 prefill 进入 decode
+            # 容错：防止极少数情况下请求直接进入 decode 而漏记 TTFT
             for seq in seqs:
                 if seq.seq_id in pending_ttft:
                     ttfts[seq.seq_id] = step_end - arrival_time
@@ -140,6 +152,7 @@ def main():
     print("\n" + "="*50)
     print(f"测试完成！结果已保存至: {filepath}")
     print("-" * 50)
+    print(f"chunk size: {llm.scheduler.chunk_size}")
     print(f"总吞吐量: {result['metrics']['throughput_tok_s']} tok/s")
     print(f"平均 TTFT: {result['metrics']['avg_ttft_ms']} ms")
     print(f"P99 TTFT: {result['metrics']['p99_ttft_ms']} ms")

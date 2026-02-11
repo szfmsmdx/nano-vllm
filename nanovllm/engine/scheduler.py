@@ -4,9 +4,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
-
 class Scheduler:
-
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs # 最长 decode 长度
         self.max_num_batched_tokens = config.max_num_batched_tokens # prefill 塞进去的最大长度
@@ -31,6 +29,7 @@ class Scheduler:
 
         # prefill
         if self.waiting:
+            self.waiting = sorted(self.waiting, key=lambda s: len(s) - s.num_cached_tokens)
             finished_prefills = []
             for seq in self.waiting:
                 if num_seqs >= self.max_num_seqs:

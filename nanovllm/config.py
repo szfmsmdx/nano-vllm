@@ -16,7 +16,8 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    chunk_size: int = 128
+    chunk_size: int = 1024
+    pd_separation: bool = False
 
     # @dataclass 后自动执行
     def __post_init__(self):    
@@ -26,3 +27,5 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        if self.pd_separation:
+            assert self.tensor_parallel_size % 2 == 0, "PD separation requires even number of GPUs for symmetric split"

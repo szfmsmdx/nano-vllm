@@ -1,7 +1,7 @@
 import os
 import time
 from random import randint, seed
-from nanovllm import LLM, SamplingParams
+from nanovllm import LLML as LLM, SamplingParams
 # from vllm import LLM, SamplingParams
 
 def main():
