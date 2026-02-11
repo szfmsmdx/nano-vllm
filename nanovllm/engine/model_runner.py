@@ -42,10 +42,10 @@ class ModelRunner:
         if config.pd_separation:
             half_size = self.world_size // 2
             if rank < half_size:
-                self.pd_role = 'prefill'
+                self.pd_role = 'decode'
                 self.peer_rank = rank + half_size
             else:
-                self.pd_role = 'decode'
+                self.pd_role = 'prefill'
                 self.peer_rank = rank - half_size
 
             group_prefill = dist.new_group(list(range(0, half_size)))
@@ -178,43 +178,51 @@ class ModelRunner:
                 layer_id += 1
 
     # P2P 传输 KV Cache
-    def transfer_kv_cache(self, seq_ids: list[int], block_tables_map: dict):
+    def sync_kv_cache_for_pd(self, seqs: list[Sequence]):
         """
-        Prefill 节点调用：发送 KV Cache 到对应的 Peer Decode 节点
-        seq_ids: 本轮完成 Prefill 的序列 ID 列表
-        block_tables_map: {seq_id: [block_id1, block_id2...]}
+        在 PD 分离模式下同步完整 prefill 的 KV:
+        - prefill 角色: 发送本轮完成 prefill 的 seq KV 到 peer decode
+        - decode 角色: 接收 KV 并写入本地相同 block id
         """
-        if self.pd_role != 'prefill': return
-        for seq_id in seq_ids:
-            blocks = block_tables_map[seq_id]
-            # 发送元数据
-            meta = torch.tensor([seq_id, len(blocks)], dtype=torch.int32).cuda()
-            dist.send(meta, dst=self.peer_rank)
+        if not self.config.pd_separation or not seqs:
+            return
 
-            # 发送实际数据
-            for layer_idx in range(self.config.hf_config.num_hidden_layers):
-                for block_id in blocks:
-                    k_data = self.kv_cache[0, layer_idx, block_id]
-                    v_data = self.kv_cache[1, layer_idx, block_id]
-                    dist.send(k_data, dst=self.peer_rank)
-                    dist.send(v_data, dst=self.peer_rank)
+        if self.pd_role == 'prefill':
+            for seq in seqs:
+                blocks = seq.block_table
+                meta = torch.tensor([seq.seq_id, len(blocks)], dtype=torch.int32).cuda()
+                dist.send(meta, dst=self.peer_rank)
 
-    def recive_kv_cache(self, num_seqs_to_recv: int)->dict:
-        """
-        Decode 节点调用：从 Peer Prefill 节点接收 KV Cache
-        返回: {seq_id: [new_block_ids]} 映射
-        """
-        if self.pd_role != "decode": return {}
+                for layer_idx in range(self.config.hf_config.num_hidden_layers):
+                    for block_id in blocks:
+                        k_data = self.kv_cache[0, layer_idx, block_id]
+                        v_data = self.kv_cache[1, layer_idx, block_id]
+                        dist.send(k_data, dst=self.peer_rank)
+                        dist.send(v_data, dst=self.peer_rank)
+            return
 
-        receive_map = {}
-        for _ in range(num_seqs_to_recv):
-            meta = torch.empty(2, dtype=torch.int32).cuda()
-            dist.recv(meta, src=self.peer_rank)
-            seq_id = meta[0].item()
-            num_blocks = meta[1].item()
-            # 这里 modelrunner 是无法访问 block manager 的，所以需要在外部实现这个功能
-            pass
-        return receive_map
+        if self.pd_role == "decode":
+            seq_map = {seq.seq_id: seq for seq in seqs}
+            for _ in range(len(seqs)):
+                meta = torch.empty(2, dtype=torch.int32).cuda()
+                dist.recv(meta, src=self.peer_rank)
+                seq_id = meta[0].item()
+                num_blocks = meta[1].item()
+
+                seq = seq_map.get(seq_id)
+                if seq is None:
+                    raise KeyError(f"Missing sequence for received seq_id={seq_id}")
+                if len(seq.block_table) != num_blocks:
+                    raise ValueError(
+                        f"KV block size mismatch for seq_id={seq_id}: expected {num_blocks}, got {len(seq.block_table)}"
+                    )
+
+                for layer_idx in range(self.config.hf_config.num_hidden_layers):
+                    for block_id in seq.block_table:
+                        k_dst = self.kv_cache[0, layer_idx, block_id]
+                        v_dst = self.kv_cache[1, layer_idx, block_id]
+                        dist.recv(k_dst, src=self.peer_rank)
+                        dist.recv(v_dst, src=self.peer_rank)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         # 整理成 2D tensor，需要 padding
@@ -348,6 +356,28 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+        if self.config.pd_separation:
+            finished_prefill_seqs = []
+            if is_prefill:
+                finished_prefill_seqs = [
+                    seq for seq in seqs
+                    if seq.num_cached_tokens + getattr(seq, "current_chunk_size", 0) == len(seq)
+                ]
+
+                if self.pd_role == "prefill":
+                    input_ids, positions = self.prepare_prefill(seqs)
+                    _ = self.run_model(input_ids, positions, True)
+                    reset_context()
+                    self.sync_kv_cache_for_pd(finished_prefill_seqs)
+                elif self.pd_role == "decode":
+                    self.sync_kv_cache_for_pd(finished_prefill_seqs)
+
+                return [None] * len(seqs) if self.rank == 0 else None
+
+            # decode: 仅 decode 角色执行计算
+            if self.pd_role == "prefill":
+                return [None] * len(seqs) if self.rank == 0 else None
+
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
