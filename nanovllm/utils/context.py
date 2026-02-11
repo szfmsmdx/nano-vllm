@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import torch
 
-
+# 全局单例
 @dataclass
 class Context:
     is_prefill: bool = False
@@ -11,7 +11,7 @@ class Context:
     max_seqlen_k: int = 0
     slot_mapping: torch.Tensor | None = None
     context_lens: torch.Tensor | None = None
-    block_tables: torch.Tensor | None = None
+    block_tables: torch.Tensor | None = None    # 如果不是 None，则指明 kv cache存放地址，告诉 GPU 历史 KV 去哪读
 
 _CONTEXT = Context()
 

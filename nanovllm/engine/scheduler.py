@@ -10,6 +10,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.max_num_seqs = config.max_num_seqs # 最长 decode 长度
         self.max_num_batched_tokens = config.max_num_batched_tokens # prefill 塞进去的最大长度
+        self.chunk_size = config.chunk_size
         self.eos = config.eos
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         # continues batching基础实现
@@ -23,28 +24,48 @@ class Scheduler:
         self.waiting.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
+        # 加入 chunk prefill 特性
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:    # prefill 优先调度
-            seq = self.waiting[0]
-            # num_batched_tokens : 本轮积攒的 prefill Token 长度
-            # len(seq) 当前请求 seq 的长度
-            # max_num_batched_tokens 一次性最多多少个
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
-                break
-            num_seqs += 1
-            self.block_manager.allocate(seq)
-            # 这个 seq 真正要算的部分
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
-            seq.status = SequenceStatus.RUNNING
-            self.waiting.popleft()  # 取出 prefill 的
-            self.running.append(seq)
-            scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            return scheduled_seqs, True
 
+        # prefill
+        if self.waiting:
+            finished_prefills = []
+            for seq in self.waiting:
+                if num_seqs >= self.max_num_seqs:
+                    break
+
+                total_buget_remain = self.max_num_batched_tokens - num_batched_tokens
+                if total_buget_remain <= 0:
+                    break
+
+                if seq.num_cached_tokens == 0:
+                    if not self.block_manager.can_allocate(seq):
+                        break
+                    self.block_manager.allocate(seq)
+
+                remain_len = len(seq) - seq.num_cached_tokens
+                chunk_len = min(remain_len, self.chunk_size, total_buget_remain)
+
+                if chunk_len <= 0:
+                    continue
+
+                seq.current_chunk_size = chunk_len
+                num_batched_tokens += chunk_len
+                num_seqs += 1
+                scheduled_seqs.append(seq)
+
+                if seq.num_cached_tokens + chunk_len == len(seq):
+                    seq.status = SequenceStatus.RUNNING
+                    finished_prefills.append(seq)
+
+            if scheduled_seqs:
+                for seq in finished_prefills:
+                    self.waiting.remove(seq)
+                    self.running.append(seq)
+                return scheduled_seqs, True
+            
         # decode
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
@@ -54,13 +75,18 @@ class Scheduler:
                 else:
                     self.preempt(seq)
                     break
+
             else:
                 num_seqs += 1
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        return scheduled_seqs, False
+            
+        if scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs))
+            return scheduled_seqs, False
+        
+        return [], False
+            
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
@@ -69,8 +95,21 @@ class Scheduler:
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         for seq, token_id in zip(seqs, token_ids):
-            seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
-                seq.status = SequenceStatus.FINISHED
-                self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+            chunk_size = getattr(seq, "current_chunk_size", 0)
+            if chunk_size > 0:  # 说明是 prefill 阶段
+                seq.num_cached_tokens += chunk_size
+                delattr(seq, "current_chunk_size")
+                if seq.num_cached_tokens == len(seq):
+                    if token_id is not None:
+                        seq.append_token(token_id)
+                    if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                        seq.status = SequenceStatus.FINISHED
+                        self.block_manager.deallocate(seq)
+                        if seq in self.running:
+                            self.running.remove(seq)
+            else:   # decode 阶段
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    if seq in self.running: self.running.remove(seq)

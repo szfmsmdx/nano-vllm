@@ -41,6 +41,7 @@ class BlockManager:
         return h.intdigest()
 
     def _allocate_block(self, block_id: int) -> Block:
+        """根据block id分配block"""
         block = self.blocks[block_id]
         assert block.ref_count == 0 # 当前有多少个seq在使用这个 block
         block.reset()
@@ -58,7 +59,7 @@ class BlockManager:
 
     def allocate(self, seq: Sequence):
         """
-        对 prefill sequence请求分配block
+        对 prefill sequence请求初始化分配block
         """
         assert not seq.block_table  # 条件为 false 时执行，如果为空就是 true，就不用 manager 分配了
         h = -1
@@ -96,20 +97,28 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        """
+        seq 多出来一个块，判断 block 池能否添加上这一个 token 的block
+        
+        用于 decode
+        """
+        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)    # 如果不是多出来的，那么后面就是false，已经分配好了无须考虑
 
     def may_append(self, seq: Sequence):
+        """
+        prepare append token
+        """
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
-        if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
+        if len(seq) % self.block_size == 1: # 第一个位置
+            assert last_block.hash != -1    # assert 是为负的时候才进行
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
-        elif len(seq) % self.block_size == 0:
+        elif len(seq) % self.block_size == 0:   # 最后一个位置
             assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+            token_ids = seq.block(seq.num_blocks-1) # 上一个token block存的 token ids
+            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1  # 上一个
             h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id

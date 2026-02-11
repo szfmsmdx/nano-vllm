@@ -29,6 +29,7 @@ class Sequence:
         self.ignore_eos = sampling_params.ignore_eos
 
     def __len__(self):
+        """当前 seq 有多少 token"""
         return self.num_tokens
 
     def __getitem__(self, key):

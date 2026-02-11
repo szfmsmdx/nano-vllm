@@ -48,17 +48,47 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
+        """
+        执行引擎的一个推理步 (Step)。
+        
+        这是推理循环的核心函数，每一次调用都会推动系统向前走一步：
+        1. 调度 (Schedule): 决定当前是做 Prefill 还是 Decode，选出要运行的 Sequence。
+        2. 执行 (Run): 调用 ModelRunner (可能在另一个进程) 执行模型的前向传播和采样。
+        3. 后处理 (Postprocess): 更新 Sequence 的状态 (追加 Token、检查结束条件、释放资源)。
+        
+        Returns:
+            tuple:
+                - outputs (list): 本轮刚刚完成 (Finished) 的请求结果列表。
+                - num_tokens (int): 本轮处理的 Token 总数 (用于计算吞吐量)。
+                                    如果是 Prefill，为总 Input Token 数；
+                                    如果是 Decode，为生成的 Token 数 (即 Batch Size, 负数表示)。
+        """
+        # 1. 调度阶段
+        # 询问 Scheduler 本轮该跑哪些请求 (seqs)，以及是 Prefill 还是 Decode 模式 (is_prefill)
         seqs, is_prefill = self.scheduler.schedule()
-        if not seqs: return [], 0
 
-        num_tokens = sum(getattr(seq, "current_chunk_size", 0) for seq in seqs) if is_prefill else -len(seqs)
-
+        # 2. 模型执行阶段
+        # 通过 IPC (跨进程通信) 调用 ModelRunner 的 run 方法
+        # 输入: 本轮调度的 seqs 和模式标志
+        # 输出: 采样生成的 token_ids 列表 (每个 seq 对应一个新 token)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+
+        # 3. 后处理阶段
+        # 将生成的 token_ids 追加到对应的 Sequence 中
+        # 检查是否遇到 EOS 或达到最大长度，如果完成则释放 Block 资源
         self.scheduler.postprocess(seqs, token_ids)
 
+        # 4. 结果收集与统计
+        # 收集本轮所有变为 FINISHED 状态的请求，准备返回给用户
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        
+        # 计算本轮吞吐量统计指标
+        # 如果是 Prefill，处理的是 prompt 中的所有 token (sum(len(seq)))
+        # 如果是 Decode，处理的是并行生成的 token 数 (即 -len(seqs), 这里的负号是内部约定的标记，用于由外层区分阶段)
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
+        
         return outputs, num_tokens
-    
+
     def is_finished(self):
         return self.scheduler.is_finished()
 
