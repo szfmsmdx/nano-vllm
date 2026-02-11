@@ -199,21 +199,39 @@ class ModelRunner:
                     dist.send(k_data, dst=self.peer_rank)
                     dist.send(v_data, dst=self.peer_rank)
 
-    def recive_kv_cache(self, num_seqs_to_recv: int)->dict:
+    def recive_kv_cache(self, recv_block_tables_map: dict[int, list[int]]) -> dict[int, list[int]]:
         """
         Decode 节点调用：从 Peer Prefill 节点接收 KV Cache
-        返回: {seq_id: [new_block_ids]} 映射
+        recv_block_tables_map: 外部提前分配好的 block table，避免 ModelRunner 直接依赖 BlockManager
+        返回: {seq_id: [block_id...]} 映射
         """
-        if self.pd_role != "decode": return {}
+        if self.pd_role != "decode":
+            return {}
 
         receive_map = {}
+        num_seqs_to_recv = len(recv_block_tables_map)
         for _ in range(num_seqs_to_recv):
             meta = torch.empty(2, dtype=torch.int32).cuda()
             dist.recv(meta, src=self.peer_rank)
             seq_id = meta[0].item()
             num_blocks = meta[1].item()
-            # 这里 modelrunner 是无法访问 block manager 的，所以需要在外部实现这个功能
-            pass
+
+            blocks = recv_block_tables_map.get(seq_id)
+            if blocks is None:
+                raise KeyError(f"Missing block table for received seq_id={seq_id}")
+            if len(blocks) != num_blocks:
+                raise ValueError(
+                    f"KV block size mismatch for seq_id={seq_id}: expected {num_blocks}, got {len(blocks)}"
+                )
+
+            for layer_idx in range(self.config.hf_config.num_hidden_layers):
+                for block_id in blocks:
+                    k_dst = self.kv_cache[0, layer_idx, block_id]
+                    v_dst = self.kv_cache[1, layer_idx, block_id]
+                    dist.recv(k_dst, src=self.peer_rank)
+                    dist.recv(v_dst, src=self.peer_rank)
+
+            receive_map[seq_id] = blocks
         return receive_map
 
     def prepare_block_tables(self, seqs: list[Sequence]):
