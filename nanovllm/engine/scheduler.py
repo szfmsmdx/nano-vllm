@@ -29,7 +29,7 @@ class Scheduler:
 
         # prefill
         if self.waiting:
-            self.waiting = sorted(self.waiting, key=lambda s: len(s) - s.num_cached_tokens)
+            self.waiting = deque(sorted(self.waiting, key=lambda s: len(s) - s.num_cached_tokens))
             finished_prefills = []
             for seq in self.waiting:
                 if num_seqs >= self.max_num_seqs:

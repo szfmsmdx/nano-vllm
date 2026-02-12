@@ -78,13 +78,22 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    # IPC序列化和反序列化
     def __getstate__(self):
+        chunk_size = getattr(self, "current_chunk_size", None)
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token) # 为 0 传 tokenids（prefill)否则就是decode阶段了
+                self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+                chunk_size) # 为 0 传 tokenids（prefill)否则就是decode阶段了
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:4]
+        val = state[4]
         if self.num_completion_tokens == 0:
-            self.token_ids = state[-1]
+            self.token_ids = val
         else:
-            self.last_token = state[-1]
+            self.last_token = val
+        
+        if len(state) > 5:
+            chunk_size = state[5]
+            if chunk_size is not None:
+                self.current_chunk_size = chunk_size

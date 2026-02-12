@@ -1,6 +1,10 @@
 import os
 import time
 import json
+
+os.environ["MKL_SERVICE_FORCE_INTEL"] = "1"
+os.environ["MKL_THREADING_LAYER"] = "GNU"
+
 import numpy as np
 from datetime import datetime
 from random import randint, seed
@@ -14,7 +18,7 @@ def main():
     max_input_len = 1024
     max_ouput_len = 1024
     # 替换为你本地的模型路径
-    path = os.path.expanduser("/data3/szf_hf/huggingface/model/Qwen2.5-0.5B")
+    path = os.path.expanduser("/data3/szf_hf/huggingface/model/Qwen3-0.6B")
     
     if not os.path.exists(path):
         # 兼容性路径 fallback

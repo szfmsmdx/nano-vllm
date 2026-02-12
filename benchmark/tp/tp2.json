@@ -1,0 +1,25 @@
+{
+    "timestamp": "2026-02-12T11:44:44.425347",
+    "model": "/data3/szf_hf/huggingface/model/Qwen3-0.6B",
+    "config": {
+        "num_seqs": 256,
+        "max_input_len": 1024,
+        "max_output_len": 1024,
+        "tensor_parallel_size": 2,
+        "enforce_eager": false,
+        "kvcache_block_size": 256,
+        "chunk_size": 256
+    },
+    "metrics": {
+        "total_time_s": 17.9186,
+        "total_tokens_processed": 276537,
+        "total_tokens_generated": 133710,
+        "throughput_tok_s": 15432.93,
+        "prefill_throughput_tok_s": 59105.03,
+        "decode_throughput_tok_s": 8630.48,
+        "avg_ttft_ms": 1360.33,
+        "p99_ttft_ms": 2417.44,
+        "avg_tpot_ms": 0.18,
+        "p99_tpot_ms": 1.06
+    }
+}
