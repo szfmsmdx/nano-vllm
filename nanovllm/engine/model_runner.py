@@ -8,12 +8,12 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, get_context, reset_context, ParallelState
 from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], shm_name: str = "nanovllm"):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -21,31 +21,97 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank    # 全局rank
         self.event = event
+        self.tensor_parallel_size = config.tensor_parallel_size
+        self.instance_tp_size = config.instance_tp_size
+        self.shm_name = shm_name
 
         # 初始化逻辑是同步的，当 world size个进程连接到这个 group 队列中才会返回
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)  # 分布式训练组
         torch.cuda.set_device(rank)
+
+        # 建立通信组
+        self.tp_group = None
+        self.transfer_peer = None
+
+        if config.pd_separation:
+            prefill_ranks = list(range(0, self.instance_tp_size))
+            decode_ranks = list(range(self.instance_tp_size, self.tensor_parallel_size))
+
+            self.prefill_group = dist.new_group(prefill_ranks)
+            self.decode_group = dist.new_group(decode_ranks)
+
+            if rank in prefill_ranks:
+                self.tp_group = self.prefill_group
+                self.instance_rank = rank
+                self.is_prefill_worker = True
+                self.transfer_peer = rank + self.instance_tp_size
+            else:
+                self.tp_group = self.decode_group
+                self.instance_rank = rank - self.instance_tp_size
+                self.is_prefill_worker = False
+                self.transfer_peer = rank - self.instance_tp_size
+        else:
+            self.tp_group = dist.group.WORLD
+            self.instance_rank = rank
+            self.is_prefill_worker = True
+
+        ParallelState.set_info(self.instance_rank, self.instance_tp_size)
+        set_context(False, tp_group=self.tp_group)
+
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
+        
         self.model = Qwen3ForCausalLM(hf_config)    # 自己重新写的支持并行的 Qwen3ForCausalLM
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        
         self.warmup_model()
         self.allocate_kv_cache()
+        
         if not self.enforce_eager:      # True 则走普通 torch 代码
             self.capture_cudagraph()
+
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:   # 主进程逻辑
-                self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)   # 1MB
+                self.shm = SharedMemory(name=self.shm_name, create=True, size=2**20)   # 1MB
                 dist.barrier()  # 等待所有的分布式进程都到达 barrier，一种同步操作
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name="nanovllm")    # 连接主进程的 sharemem
+                self.shm = SharedMemory(name=self.shm_name)    # 连接主进程的 sharemem
                 self.loop()
+
+    def transfer_kv_cache(self, block_ids: list[int]):
+        if not self.config.pd_separation or not block_ids:
+            return 
+        
+        block_idx = torch.tensor(block_ids, device="cuda", dtype=torch.int32)
+
+        if self.is_prefill_worker:
+            data_to_send = self.kv_cache.index_select(2, block_idx)
+            dist.send(data_to_send, dst=self.transfer_peer)
+        else:
+            recv_shape = list(self.kv_cache.shape)
+            recv_shape[2] = len(block_ids)
+            buffer = torch.empty(recv_shape, dtype=self.kv_cache.dtype, device="cuda")
+
+            dist.recv(buffer, src=self.transfer_peer)
+            self.kv_cache.index_copy_(2, block_idx, buffer)
+
+        torch.cuda.synchronize()
+
+    def recv_decode_res(self, seq_len: int):
+        """
+        rank 0接收decode leader的结果，仅在PD且rank 0时有效
+        """
+        if self.config.pd_separation and self.rank == 0:
+            res_buffer = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
+            dist.recv(res_buffer, src=self.transfer_peer)
+            return res_buffer.tolist()
+        return []
 
     def exit(self):
         if self.world_size > 1:
@@ -111,7 +177,7 @@ class ModelRunner:
         # self.world_size = config.tensor_parallel_size 有几块 GPU
         # hf_config.num_key_value_heads : 有多少个头
         # num_kv_heads 每个卡负责多少个 kv heads
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size # 一共的 kv head 个数 / 总 GPU 数量，代表当前显卡需要开辟多少个头的数量
+        num_kv_heads = hf_config.num_key_value_heads // self.instance_tp_size # 一共的 kv head 个数 / 总 GPU 数量，代表当前显卡需要开辟多少个头的数量
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
 
         # 计算一个 block 存放的大小
@@ -135,44 +201,6 @@ class ModelRunner:
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
-
-    def prepare_prefill_legacy(self, seqs: list[Sequence]):
-        input_ids = []
-        positions = []
-        cu_seqlens_q = [0]  # 累计长度
-        cu_seqlens_k = [0]
-        max_seqlen_q = 0
-        max_seqlen_k = 0
-        slot_mapping = []
-        block_tables = None
-        for seq in seqs:
-            seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])   # 没有被 cache 过的部分 extend 拼接
-            positions.extend(list(range(seq.num_cached_tokens, seqlen)))    # 拼接位置
-            seqlen_q = seqlen - seq.num_cached_tokens
-            seqlen_k = seqlen
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))    # 针对没有被 cache 部分，slot mapping指明了该存在kv cache的哪里
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache 
-            block_tables = self.prepare_block_tables(seqs)
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        return input_ids, positions
     
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids, positions = [], []
@@ -262,9 +290,15 @@ class ModelRunner:
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        group_rank = dist.get_rank(group=self.tp_group) if self.tp_group else 0
+        temperatures = self.prepare_sample(seqs) if group_rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self.sampler(logits, temperatures).tolist() if group_rank == 0 else None
+
+        if self.config.pd_separation and not is_prefill and self.instance_rank == 0 and not self.is_prefill_worker:
+            res_tensor = torch.tensor(token_ids, dtype=torch.int32, device="cuda")
+            dist.send(res_tensor, dst=0)
+
         reset_context()
         return token_ids
 

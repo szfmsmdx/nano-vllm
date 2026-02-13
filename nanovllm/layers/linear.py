@@ -2,7 +2,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
-
+from nanovllm.utils.context import ParallelState, get_context
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -20,8 +20,10 @@ class LinearBase(nn.Module):
     ):
         super().__init__()
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        # self.tp_rank = dist.get_rank()
+        # self.tp_size = dist.get_world_size()
+        self.tp_rank = ParallelState.get_rank()
+        self.tp_size = ParallelState.get_world_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -59,8 +61,8 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
-        # 这里为啥把 0 传给 tp_size 呢？因为torch中存储是以列优先的所以相当于做了一个转置
+        # tp_size = dist.get_world_size()
+        tp_size = ParallelState.get_world_size()
         super().__init__(input_size, divide(output_size, tp_size), bias, 0) 
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -104,7 +106,8 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_kv_heads: int | None = None,
         bias: bool = False,
     ): 
-        tp_size = dist.get_world_size()
+        # tp_size = dist.get_world_size()
+        tp_size = ParallelState.get_world_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
         self.num_heads = divide(total_num_heads, tp_size)
@@ -137,7 +140,8 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
+        # tp_size = dist.get_world_size()
+        tp_size = ParallelState.get_world_size()
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
@@ -147,8 +151,24 @@ class RowParallelLinear(LinearBase):
         loaded_weight = loaded_weight.narrow(self.tp_dim, start_idx, shard_size)
         param_data.copy_(loaded_weight)
 
+    # def forward(self, x: torch.Tensor) -> torch.Tensor:
+    #     y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+    #     if self.tp_size > 1:
+    #         dist.all_reduce(y)
+    #     return y
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
-        if self.tp_size > 1:
-            dist.all_reduce(y)
+        ctx = get_context()
+        group = ctx.tp_group
+        if group is not None:
+            rank = dist.get_rank(group=group)   # 从 tp group获取 rank
+            world_size = dist.get_world_size(group=group)
+        else:
+            rank = 0
+            world_size = 1
+
+        y = F.linear(x, self.weight, self.bias if rank == 0 else None)
+
+        if world_size > 1:
+            dist.all_reduce(y, group=group)
         return y

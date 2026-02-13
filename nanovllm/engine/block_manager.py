@@ -98,20 +98,18 @@ class BlockManager:
 
     def can_append(self, seq: Sequence) -> bool:
         """
-        seq 多出来一个块，判断 block 池能否添加上这一个 token 的block
-        
-        用于 decode
+        decode: seq 多出来一个块，判断 block 池能否添加上这一个 token 的block
         """
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)    # 如果不是多出来的，那么后面就是false，已经分配好了无须考虑
 
     def may_append(self, seq: Sequence):
         """
-        prepare append token
+        decode: prepare append token
         """
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1: # 第一个位置
-            assert last_block.hash != -1    # assert 是为负的时候才进行
+            assert last_block.hash != -1    # 判断条件为 false 才报错
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)

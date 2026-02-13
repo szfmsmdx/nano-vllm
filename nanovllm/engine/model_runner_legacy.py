@@ -136,7 +136,7 @@ class ModelRunner:
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
-    def prepare_prefill_legacy(self, seqs: list[Sequence]):
+    def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
         positions = []
         cu_seqlens_q = [0]  # 累计长度
@@ -171,48 +171,6 @@ class ModelRunner:
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        return input_ids, positions
-    
-    def prepare_prefill(self, seqs: list[Sequence]):
-        input_ids, positions = [], []
-        cu_seqlens_q, cu_seqlens_k = [0], [0]
-        max_seqlen_q, max_seqlen_k = 0, 0
-        slot_mapping = []
-
-        for seq in seqs:
-            # 兼容 warm up 使用的非 chunk 全量 prefill
-            chunk_size = getattr(seq, "current_chunk_size", len(seq) - seq.num_cached_tokens)
-            start_pos = seq.num_cached_tokens
-            end_pos = start_pos + chunk_size
-
-            input_ids.extend(seq[start_pos : end_pos])
-            positions.extend(list(range(start_pos, end_pos)))
-
-            seqlen_q = chunk_size
-            seqlen_k = end_pos
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q, max_seqlen_k = max(seqlen_q, max_seqlen_q), max(seqlen_k, max_seqlen_k)
-
-            if not seq.block_table:
-                continue
-
-            # 给token分配 block槽位
-            for i in range(start_pos, end_pos):
-                b_idx, b_offset = i // self.block_size, i % self.block_size
-                slot = seq.block_table[b_idx] * self.block_size + b_offset
-                slot_mapping.append(slot)
-
-        # 如果存在已经缓存的 token(cu_seqlens_k > cu_seqlens_q)，那么读取历史 KV
-        block_tables = self.prepare_block_tables(seqs) if cu_seqlens_k[-1] > cu_seqlens_q[-1] else None
-
-        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 

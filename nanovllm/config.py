@@ -29,3 +29,8 @@ class Config:
         assert self.max_num_batched_tokens >= self.max_model_len
         if self.pd_separation:
             assert self.tensor_parallel_size % 2 == 0, "PD separation requires even number of GPUs for symmetric split"
+            self.instance_tp_size = self.tensor_parallel_size // 2
+        else:
+            self.instance_tp_size = self.tensor_parallel_size
+        
+        assert 1 <= self.instance_tp_size <= 8
