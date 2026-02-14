@@ -26,7 +26,7 @@ class ModelRunner:
         self.shm_name = shm_name
 
         # 初始化逻辑是同步的，当 world size个进程连接到这个 group 队列中才会返回
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)  # 分布式训练组
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank, device_id=torch.device(f"cuda:{rank}"))  # 分布式训练组
         torch.cuda.set_device(rank)
 
         # 建立通信组
@@ -101,7 +101,7 @@ class ModelRunner:
                 dist.send(data_to_send, dst=self.transfer_peer)
             else:
                 recv_shape = list(self.kv_cache.shape)
-                recv_shape[2] = len(current_batch_size)
+                recv_shape[2] = current_batch_size
                 buffer = torch.empty(recv_shape, dtype=self.kv_cache.dtype, device="cuda")
 
                 dist.recv(buffer, src=self.transfer_peer)
@@ -205,7 +205,7 @@ class ModelRunner:
         # 整理成 2D tensor，需要 padding
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
     
     def prepare_prefill(self, seqs: list[Sequence]):

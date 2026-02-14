@@ -77,8 +77,8 @@ class LLMEngine:
             self.model_runner.call("exit")
             del self.model_runner
         else:
-            self.prefill_runner.call("exit")
             self._drive_decode_runner("exit")
+            self.prefill_runner.call("exit")
             self.shm_decode.close()
             self.shm_decode.unlink()
             del self.prefill_runner
@@ -129,10 +129,17 @@ class LLMEngine:
 
     def generate(
         self,
-        prompts: list[str] | list[list[int]],
-        sampling_params: SamplingParams | list[SamplingParams],
+        prompts: list[str] | list[list[int]] | str,
+        sampling_params: SamplingParams | list[SamplingParams] | None=None,
         use_tqdm: bool = True,
     ) -> list[str]:
+        if isinstance(prompts, str) or (isinstance(prompts, list) and len(prompts) > 0 and isinstance(prompts[0], int)):
+            prompts = [prompts]
+        if sampling_params is None:
+            sampling_params = SamplingParams()
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):

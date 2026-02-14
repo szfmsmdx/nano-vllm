@@ -51,7 +51,8 @@ def main():
         max_model_len=4096, 
         tensor_parallel_size=args.tp, 
         pd_separation=args.pd,
-        chunk_size=args.chunk_size
+        chunk_size=args.chunk_size,
+        gpu_memory_utilization=0.5
     )
 
     # --- 准备测试数据 ---
@@ -127,7 +128,7 @@ def main():
             "max_output_len": args.max_output_len,
             "tensor_parallel_size": args.tp,
             "enforce_eager": args.enforce_eager,
-            "kvcache_block_size": llm.llm_engine.config.kvcache_block_size,
+            "kvcache_block_size": llm.config.kvcache_block_size,
             "chunk_size": args.chunk_size,
             "pd_separation": args.pd
         },
@@ -153,7 +154,7 @@ def main():
         json.dump(result, f, indent=4, ensure_ascii=False)
     
     print(f"\n{'='*50}")
-    print(f"TP {args.tp} | Chunk Size {args.chunk_size} | Use PD {args.pd}")
+    print(f"TP: {args.tp} | Chunk Size: {args.chunk_size} | Use PD: {args.pd}")
     print(f"Results saved to: {filepath}")
     print(f"Total Throughput: {result['metrics']['throughput_tok_s']} tok/s")
     print(f"Prefill Throughput: {result['metrics']['prefill_throughput_tok_s']} tok/s")
