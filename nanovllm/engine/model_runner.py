@@ -88,18 +88,24 @@ class ModelRunner:
         if not self.config.pd_separation or not block_ids:
             return 
         
-        block_idx = torch.tensor(block_ids, device="cuda", dtype=torch.int32)
+        BATCH_SIZE = 32
+        all_block_idx = torch.tensor(block_ids, device="cuda", dtype=torch.int64)
+        total_blocks = len(block_ids)
 
-        if self.is_prefill_worker:
-            data_to_send = self.kv_cache.index_select(2, block_idx)
-            dist.send(data_to_send, dst=self.transfer_peer)
-        else:
-            recv_shape = list(self.kv_cache.shape)
-            recv_shape[2] = len(block_ids)
-            buffer = torch.empty(recv_shape, dtype=self.kv_cache.dtype, device="cuda")
+        for i in range(0, total_blocks, BATCH_SIZE):
+            batch_idx = all_block_idx[i : i + BATCH_SIZE]
+            current_batch_size = batch_idx.size(0)
 
-            dist.recv(buffer, src=self.transfer_peer)
-            self.kv_cache.index_copy_(2, block_idx, buffer)
+            if self.is_prefill_worker:
+                data_to_send = self.kv_cache.index_select(2, batch_idx)
+                dist.send(data_to_send, dst=self.transfer_peer)
+            else:
+                recv_shape = list(self.kv_cache.shape)
+                recv_shape[2] = len(current_batch_size)
+                buffer = torch.empty(recv_shape, dtype=self.kv_cache.dtype, device="cuda")
+
+                dist.recv(buffer, src=self.transfer_peer)
+                self.kv_cache.index_copy_(2, batch_idx, buffer)
 
         torch.cuda.synchronize()
 
@@ -108,7 +114,7 @@ class ModelRunner:
         rank 0接收decode leader的结果，仅在PD且rank 0时有效
         """
         if self.config.pd_separation and self.rank == 0:
-            res_buffer = torch.zeros(seq_len, dtype=torch.int32, device="cuda")
+            res_buffer = torch.zeros(seq_len, dtype=torch.long, device="cuda")
             dist.recv(res_buffer, src=self.transfer_peer)
             return res_buffer.tolist()
         return []
@@ -199,7 +205,7 @@ class ModelRunner:
         # 整理成 2D tensor，需要 padding
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = torch.tensor(block_tables, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         return block_tables
     
     def prepare_prefill(self, seqs: list[Sequence]):
@@ -296,7 +302,7 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if group_rank == 0 else None
 
         if self.config.pd_separation and not is_prefill and self.instance_rank == 0 and not self.is_prefill_worker:
-            res_tensor = torch.tensor(token_ids, dtype=torch.int32, device="cuda")
+            res_tensor = torch.tensor(token_ids, dtype=torch.long, device="cuda")
             dist.send(res_tensor, dst=0)
 
         reset_context()

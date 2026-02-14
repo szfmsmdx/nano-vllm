@@ -1,4 +1,5 @@
 import atexit
+import pickle
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -44,18 +45,19 @@ class LLMEngine:
                 self.ps.append(process)
                 prefill_events.append(event)
 
-            self.prefill_runner = ModelRunner(config, 0, prefill_events, "nanovllm_prefill")
 
             decode_events = []
+            self.shm_decode = SharedMemory(name="nanovllm_decode", create=True, size=2**20)
+
             for i in range(config.instance_tp_size, config.tensor_parallel_size):
                 event = ctx.Event()
                 process = ctx.Process(target=ModelRunner, args=(config, i, event, "nanovllm_decode"))
                 process.start()
                 self.ps.append(process)
-                decode_events.append(process)
+                decode_events.append(event)
             
-            self.shm_decode = SharedMemory(name="nanovllm_decode", create=True, size=2**20)
             self.decode_events = decode_events
+            self.prefill_runner = ModelRunner(config, 0, prefill_events, "nanovllm_prefill")
         
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
@@ -63,7 +65,6 @@ class LLMEngine:
         atexit.register(self.exit)  # 注册 exit，不管崩溃还是正常结束都会调用 exit
 
     def _drive_decode_runner(self, method_name, *args):
-        import pickle
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm_decode.buf[0:4] = n.to_bytes(4, "little")
@@ -112,7 +113,7 @@ class LLMEngine:
                 block_list = list(blocks_to_transfer)
 
                 self._drive_decode_runner("transfer_kv_cache", block_list)
-                self.prefill_runner.transfer_kv_cache(block_list)
+                self.prefill_runner.call("transfer_kv_cache", block_list)
                 self.scheduler.postprocess(seqs, token_ids)
             else:
                 num_tokens = -len(seqs)

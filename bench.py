@@ -18,7 +18,7 @@ def get_args():
     parser.add_argument("--max-input-len", type=int, default=1024, help="Max input length")
     parser.add_argument("--max-output-len", type=int, default=1024, help="Max output length")
     parser.add_argument("--tp", type=int, default=4, help="Tensor Parallel Size (Total GPUs)")
-    parser.add_argument("--pd-separation", action="store_true", help="Enable Prefill-Decode Separation")
+    parser.add_argument("--pd", action="store_true", help="Enable Prefill-Decode Separation")
     parser.add_argument("--enforce-eager", action="store_true", help="Enforce eager execution")
     parser.add_argument("--chunk-size", type=int, default=256, help="Chunk size for prefill")
     return parser.parse_args()
@@ -39,7 +39,7 @@ def main():
     print(f"Benchmark Configuration:")
     print(f"  Model: {path}")
     print(f"  TP Size: {args.tp}")
-    print(f"  PD Separation: {args.pd_separation}")
+    print(f"  PD Separation: {args.pd}")
     print(f"  Num Seqs: {args.num_seqs}")
     print(f"  Chunk Size: {args.chunk_size}")
     print(f"{'='*50}\n")
@@ -50,7 +50,7 @@ def main():
         enforce_eager=args.enforce_eager, 
         max_model_len=4096, 
         tensor_parallel_size=args.tp, 
-        pd_separation=args.pd_separation,
+        pd_separation=args.pd,
         chunk_size=args.chunk_size
     )
 
@@ -129,7 +129,7 @@ def main():
             "enforce_eager": args.enforce_eager,
             "kvcache_block_size": llm.llm_engine.config.kvcache_block_size,
             "chunk_size": args.chunk_size,
-            "pd_separation": args.pd_separation
+            "pd_separation": args.pd
         },
         "metrics": {
             "total_time_s": round(total_duration, 4),
@@ -146,14 +146,14 @@ def main():
     }
 
     os.makedirs("./benchmark", exist_ok=True)
-    filename = f"bench_{datetime.now().strftime('%Y%m%d_%H%M%S')}_pd{args.pd_separation}.json"
+    filename = f"bench_{datetime.now().strftime('%Y%m%d_%H%M%S')}_pd{args.pd}.json"
     filepath = os.path.join("./benchmark", filename)
     
     with open(filepath, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=4, ensure_ascii=False)
     
     print(f"\n{'='*50}")
-    print(f"TP {args.tp} | Chunk Size {args.chunk_size} | Use PD {args.pd_separation}")
+    print(f"TP {args.tp} | Chunk Size {args.chunk_size} | Use PD {args.pd}")
     print(f"Results saved to: {filepath}")
     print(f"Total Throughput: {result['metrics']['throughput_tok_s']} tok/s")
     print(f"Prefill Throughput: {result['metrics']['prefill_throughput_tok_s']} tok/s")

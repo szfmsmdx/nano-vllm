@@ -77,11 +77,16 @@ class ParallelLMHead(VocabParallelEmbedding):
         logits = F.linear(x, self.weight)
 
         group = context.tp_group
-        tp_size = dist.get_world_size(group=group) if group is not None else 1
-        rank = dist.get_rank(group=group) if group is not None else 0
+        # tp_size = dist.get_world_size(group=group) if group is not None else 1
+        # rank = dist.get_rank(group=group) if group is not None else 0
 
         if self.tp_size > 1:
-            all_logits = [torch.empty_like(logits) for _ in range(tp_size)] if rank == 0 else None
-            dist.gather(logits, all_logits, dst=0, group=group)
+            rank = dist.get_rank(group=group) if group is not None else 0
+            if group is not None:
+                dst = dist.get_global_rank(group, 0)
+            else:
+                dst = 0
+            all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if rank == 0 else None
+            dist.gather(logits, all_logits, dst=dst, group=group)
             logits = torch.cat(all_logits, -1) if rank == 0 else None
         return logits

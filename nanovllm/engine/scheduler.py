@@ -85,7 +85,6 @@ class Scheduler:
             return scheduled_seqs, False
         
         return [], False
-            
 
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING

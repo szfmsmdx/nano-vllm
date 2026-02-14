@@ -83,7 +83,7 @@ class Sequence:
         chunk_size = getattr(self, "current_chunk_size", None)
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token,
-                chunk_size) # 为 0 传 tokenids（prefill)否则就是decode阶段了
+                chunk_size, self.temperature) # 为 0 传 tokenids（prefill)否则就是decode阶段了
 
     def __setstate__(self, state):
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:4]
@@ -97,3 +97,7 @@ class Sequence:
             chunk_size = state[5]
             if chunk_size is not None:
                 self.current_chunk_size = chunk_size
+        if len(state) > 6:
+            self.temperature = state[6]
+        else:
+            self.temperature = 1.0 # 默认值，防止旧数据报错
