@@ -7,6 +7,8 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
+from nanovllm.models.models import model_dict
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context, ParallelState
 from nanovllm.utils.loader import load_model
@@ -21,12 +23,12 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank    # 全局rank
         self.event = event
-        self.ack_event = ack_event # 新增：确认信号
+        self.ack_event = ack_event 
         self.tensor_parallel_size = config.tensor_parallel_size
         self.instance_tp_size = config.instance_tp_size
         self.shm_name = shm_name
 
-        # 初始化逻辑是同步的
+        # 初始化逻辑
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank, device_id=torch.device(f"cuda:{rank}"))
         torch.cuda.set_device(rank)
 
@@ -63,10 +65,22 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         
-        self.model = Qwen3ForCausalLM(hf_config)
+        # self.model = Qwen3ForCausalLM(hf_config)
+        # architectures = getattr(hf_config, "architectures", [])
+        # if "Qwen2MoeForCausalLM" in architectures:
+        #     self.model = Qwen3MoeForCausalLM(hf_config)
+        # else:
+        #     self.model = Qwen3ForCausalLM(hf_config)
+        self.model = model_dict[hf_config.model_type](hf_config)
+        load_model(self.model, config.model)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         
+        # 新增：传输专用流
+        self.transfer_stream = torch.cuda.Stream()
+        # 新增：保存异步通信句柄，防止被GC
+        self.async_requests = []
+
         self.warmup_model()
         self.allocate_kv_cache()
         
@@ -77,8 +91,8 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
-            if rank == 0:   # 主进程
-                self.shm = SharedMemory(name=self.shm_name, create=True, size=2**20) # 1MB
+            if rank == 0:
+                self.shm = SharedMemory(name=self.shm_name, create=True, size=2**20)
                 dist.barrier()
             else:
                 dist.barrier()
@@ -86,36 +100,55 @@ class ModelRunner:
                 self.loop()
 
     def transfer_kv_cache(self, block_ids: list[int]):
+        """
+        使用 CUDA Stream + Async NCCL 实现计算与传输重叠
+        """
         if not self.config.pd_separation or not block_ids:
             return 
         
-        BATCH_SIZE = 32
-        all_block_idx = torch.tensor(block_ids, device="cuda", dtype=torch.int64)
-        total_blocks = len(block_ids)
+        # 清理已完成的请求
+        self.async_requests = [req for req in self.async_requests if not req.is_completed()]
 
-        for i in range(0, total_blocks, BATCH_SIZE):
-            batch_idx = all_block_idx[i : i + BATCH_SIZE]
-            current_batch_size = batch_idx.size(0)
+        # 在专用传输流上执行，不阻塞默认计算流
+        with torch.cuda.stream(self.transfer_stream):
+            all_block_idx = torch.tensor(block_ids, device="cuda", dtype=torch.int64)
+            num_blocks = all_block_idx.size(0)
 
             if self.is_prefill_worker:
-                data_to_send = self.kv_cache.index_select(2, batch_idx)
-                dist.send(data_to_send, dst=self.transfer_peer)
+                # 1. 提取数据 (Copy Kernel)
+                data_to_send = self.kv_cache.index_select(2, all_block_idx)
+                
+                # 2. 异步发送 (Comm) - 不阻塞 CPU
+                req = dist.isend(data_to_send, dst=self.transfer_peer)
+                self.async_requests.append(req)
+                
             else:
                 recv_shape = list(self.kv_cache.shape)
-                recv_shape[2] = current_batch_size
+                recv_shape[2] = num_blocks
                 buffer = torch.empty(recv_shape, dtype=self.kv_cache.dtype, device="cuda")
 
-                dist.recv(buffer, src=self.transfer_peer)
-                self.kv_cache.index_copy_(2, batch_idx, buffer)
+                # 1. 异步接收 (Comm)
+                req = dist.irecv(buffer, src=self.transfer_peer)
+                self.async_requests.append(req)
+                
+                # 2. 等待接收完成 (在 GPU Stream 层面等待，而不是 CPU)
+                # 注意：对于 PyTorch < 2.0，irecv 可能需要 req.wait() 才能保证数据就绪
+                # 这里我们强制同步一下这个流，确保 copy_ 写回是安全的
+                # 在极致优化中，可以使用 record_event / wait_event 让计算流等待
+                req.wait() 
 
-        torch.cuda.synchronize()
+                # 3. 写回 Cache (Copy Kernel)
+                self.kv_cache.index_copy_(2, all_block_idx, buffer)
+
+        # 这里的 trick 是：
+        # 我们没有调用 torch.cuda.synchronize() (除了 req.wait() 局部阻塞)
+        # 这意味着 CPU 会立即返回，主进程可以继续去调度下一个 step
+        # 而 GPU 会在 transfer_stream 上慢慢跑传输，不影响默认流上的计算
 
     def recv_decode_res(self, seq_len: int):
-        """
-        rank 0接收decode leader的结果
-        """
         if self.config.pd_separation and self.rank == 0:
             res_buffer = torch.zeros(seq_len, dtype=torch.long, device="cuda")
+            # 结果传输通常很小，可以使用同步 recv 作为屏障
             dist.recv(res_buffer, src=self.transfer_peer)
             return res_buffer.tolist()
         return []
@@ -132,7 +165,6 @@ class ModelRunner:
         dist.destroy_process_group()
 
     def loop(self):
-        """子进程循环"""
         while True:
             method_name, args = self.read_shm()
             
@@ -164,7 +196,7 @@ class ModelRunner:
             event.set()
 
     def call(self, method_name, *args):
-        if self.world_size > 1 and self.rank == 0:  # rank 0控制子进程
+        if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
         return method(*args)

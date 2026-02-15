@@ -39,21 +39,18 @@ class LLMEngine:
             prefill_events = []
             for i in range(1, config.instance_tp_size):
                 event = ctx.Event()
-                # 预填充worker不需要额外的ACK，因为它们是同步的
                 process = ctx.Process(target=ModelRunner, args=(config, i, event, "nanovllm_prefill"))
                 process.start()
                 self.ps.append(process)
                 prefill_events.append(event)
 
-
             decode_events = []
-            decode_ack_events = [] # 新增: ACK 事件列表
+            decode_ack_events = []
             self.shm_decode = SharedMemory(name="nanovllm_decode", create=True, size=2**20)
 
             for i in range(config.instance_tp_size, config.tensor_parallel_size):
                 event = ctx.Event()
-                ack_event = ctx.Event() # 为每个Decode Worker创建ACK
-                # 将 ack_event 传入子进程
+                ack_event = ctx.Event()
                 process = ctx.Process(target=ModelRunner, args=(config, i, event, "nanovllm_decode", ack_event))
                 process.start()
                 self.ps.append(process)
@@ -69,24 +66,26 @@ class LLMEngine:
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
-    def _drive_decode_runner(self, method_name, *args):
+    def _drive_decode_runner(self, method_name, *args, wait_ack=True):
         """
-        发送命令给 Decode Workers，并等待它们确认接收 (ACK)。
-        这样可以防止下一条命令覆盖未被读取的命令。
+        发送命令给 Decode Workers。
+        Args:
+            wait_ack (bool): 是否等待子进程确认接收。
+                             对于高频且由后续逻辑(如 recv)保护的命令(如 'run')，可以设为 False 以提速。
+                             对于无返回值的命令(如 'transfer_kv_cache')，必须设为 True 以防指令覆盖。
         """
         data = pickle.dumps([method_name, *args])
         n = len(data)
         self.shm_decode.buf[0:4] = n.to_bytes(4, "little")
         self.shm_decode.buf[4:n+4] = data
         
-        # 1. 触发子进程读取
         for e in self.decode_events:
             e.set()
         
-        # 2. 【关键】等待所有子进程确认读取完毕
-        for e in self.decode_ack_events:
-            e.wait()
-            e.clear() # 清除标志，为下一次做准备
+        if wait_ack:
+            for e in self.decode_ack_events:
+                e.wait()
+                e.clear()
 
     def exit(self):
         if not self.config.pd_separation:
@@ -109,14 +108,12 @@ class LLMEngine:
         self.scheduler.add(seq)
 
     def step(self):
-        # 1. 调度
         if not self.config.pd_separation:
             prefill_seqs, decode_seqs = self.scheduler.schedule()
             is_prefill = len(prefill_seqs) > 0
             seqs = prefill_seqs if is_prefill else decode_seqs
             if not seqs: return [], 0, 0
             
-            # 先统计
             prefill_count = sum(getattr(seq, "current_chunk_size", 0) for seq in seqs) if is_prefill else 0
             decode_count = len(seqs) if not is_prefill else 0
 
@@ -131,25 +128,26 @@ class LLMEngine:
             if not prefill_seqs and not decode_seqs:
                 return [], 0, 0
 
-            # 2. 统计
             prefill_count = sum(getattr(seq, "current_chunk_size", 0) for seq in prefill_seqs)
             decode_count = len(decode_seqs)
 
-            # 3. 异步Decode
+            # 1. 异步发射 Decode 任务 (wait_ack=False)
+            # 因为稍后我们会调用 recv_decode_res，它会阻塞直到 Decode 完成，
+            # 所以在此期间主进程不会发送下一条命令，覆盖风险为 0，不需要 ACK。
             if decode_seqs:
-                self._drive_decode_runner("run", decode_seqs, False)
+                self._drive_decode_runner("run", decode_seqs, False, wait_ack=False)
 
-            # 4. 同步Prefill
+            # 2. 同步执行 Prefill 任务
             prefill_token_ids = []
             if prefill_seqs:
                 prefill_token_ids = self.prefill_runner.call("run", prefill_seqs, True)
 
-            # 5. 收集
+            # 3. 收集 Decode 结果 (这里充当了同步屏障)
             decode_token_ids = []
             if decode_seqs:
                 decode_token_ids = self.prefill_runner.recv_decode_res(len(decode_seqs))
 
-            # 6. KV Cache 传输
+            # 4. KV Cache 传输
             blocks_to_transfer = set()
             for seq in prefill_seqs:
                 if seq.num_cached_tokens + getattr(seq, "current_chunk_size", 0) == len(seq):
@@ -157,10 +155,14 @@ class LLMEngine:
             
             if blocks_to_transfer:
                 block_list = list(blocks_to_transfer)
-                self._drive_decode_runner("transfer_kv_cache", block_list)
+                # 5. 发送传输指令 (wait_ack=True)
+                # 必须等待 ACK。因为如果不等，主进程可能立即进入下一个 loop 发送 'run'，
+                # 导致 Decode Worker 还没来得及处理 'transfer' 就被 'run' 覆盖了 SHM。
+                self._drive_decode_runner("transfer_kv_cache", block_list, wait_ack=True)
+                
+                # 让 Prefill 组开始发送 (同步调用)
                 self.prefill_runner.call("transfer_kv_cache", block_list)
 
-            # 7. 后处理
             self.scheduler.postprocess(prefill_seqs, prefill_token_ids)
             self.scheduler.postprocess(decode_seqs, decode_token_ids)
 
