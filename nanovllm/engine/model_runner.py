@@ -13,7 +13,7 @@ from nanovllm.utils.loader import load_model
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event], shm_name: str = "nanovllm"):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event], shm_name: str = "nanovllm", ack_event: Event | list[Event] = None):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
@@ -21,12 +21,13 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank    # 全局rank
         self.event = event
+        self.ack_event = ack_event # 新增：确认信号
         self.tensor_parallel_size = config.tensor_parallel_size
         self.instance_tp_size = config.instance_tp_size
         self.shm_name = shm_name
 
-        # 初始化逻辑是同步的，当 world size个进程连接到这个 group 队列中才会返回
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank, device_id=torch.device(f"cuda:{rank}"))  # 分布式训练组
+        # 初始化逻辑是同步的
+        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank, device_id=torch.device(f"cuda:{rank}"))
         torch.cuda.set_device(rank)
 
         # 建立通信组
@@ -62,26 +63,26 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         
-        self.model = Qwen3ForCausalLM(hf_config)    # 自己重新写的支持并行的 Qwen3ForCausalLM
+        self.model = Qwen3ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         
         self.warmup_model()
         self.allocate_kv_cache()
         
-        if not self.enforce_eager:      # True 则走普通 torch 代码
+        if not self.enforce_eager:
             self.capture_cudagraph()
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
-            if rank == 0:   # 主进程逻辑
-                self.shm = SharedMemory(name=self.shm_name, create=True, size=2**20)   # 1MB
-                dist.barrier()  # 等待所有的分布式进程都到达 barrier，一种同步操作
+            if rank == 0:   # 主进程
+                self.shm = SharedMemory(name=self.shm_name, create=True, size=2**20) # 1MB
+                dist.barrier()
             else:
                 dist.barrier()
-                self.shm = SharedMemory(name=self.shm_name)    # 连接主进程的 sharemem
+                self.shm = SharedMemory(name=self.shm_name)
                 self.loop()
 
     def transfer_kv_cache(self, block_ids: list[int]):
@@ -111,7 +112,7 @@ class ModelRunner:
 
     def recv_decode_res(self, seq_len: int):
         """
-        rank 0接收decode leader的结果，仅在PD且rank 0时有效
+        rank 0接收decode leader的结果
         """
         if self.config.pd_separation and self.rank == 0:
             res_buffer = torch.zeros(seq_len, dtype=torch.long, device="cuda")
@@ -131,8 +132,16 @@ class ModelRunner:
         dist.destroy_process_group()
 
     def loop(self):
+        """子进程循环"""
         while True:
             method_name, args = self.read_shm()
+            
+            if self.ack_event:
+                if isinstance(self.ack_event, list):
+                    pass
+                else:
+                    self.ack_event.set()
+
             self.call(method_name, *args)
             if method_name == "exit":
                 break
@@ -170,29 +179,18 @@ class ModelRunner:
         torch.cuda.empty_cache()
 
     def allocate_kv_cache(self):
-        """
-        分配当前Runner所处device的kvcache
-        """
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        # 获取当前的device
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        # self.world_size = config.tensor_parallel_size 有几块 GPU
-        # hf_config.num_key_value_heads : 有多少个头
-        # num_kv_heads 每个卡负责多少个 kv heads
-        num_kv_heads = hf_config.num_key_value_heads // self.instance_tp_size # 一共的 kv head 个数 / 总 GPU 数量，代表当前显卡需要开辟多少个头的数量
+        num_kv_heads = hf_config.num_key_value_heads // self.instance_tp_size 
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
 
-        # 计算一个 block 存放的大小
-        # block_bytes = kv(2) * 层数 * 一个block放多少 token * 多少 kv 头 * 头维度 * 每个维度的数据大小
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
-        # 计算当前 GPU 需要挂载的 kvcache block
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        # 直接占满，这里不用手动指定 dtype 的原因是，在函数调用的外部上下文已经手动做了这个操作了
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -202,7 +200,6 @@ class ModelRunner:
                 layer_id += 1
 
     def prepare_block_tables(self, seqs: list[Sequence]):
-        # 整理成 2D tensor，需要 padding
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -215,7 +212,6 @@ class ModelRunner:
         slot_mapping = []
 
         for seq in seqs:
-            # 兼容 warm up 使用的非 chunk 全量 prefill
             chunk_size = getattr(seq, "current_chunk_size", len(seq) - seq.num_cached_tokens)
             start_pos = seq.num_cached_tokens
             end_pos = start_pos + chunk_size
@@ -232,13 +228,11 @@ class ModelRunner:
             if not seq.block_table:
                 continue
 
-            # 给token分配 block槽位
             for i in range(start_pos, end_pos):
                 b_idx, b_offset = i // self.block_size, i % self.block_size
                 slot = seq.block_table[b_idx] * self.block_size + b_offset
                 slot_mapping.append(slot)
 
-        # 如果存在已经缓存的 token(cu_seqlens_k > cu_seqlens_q)，那么读取历史 KV
         block_tables = self.prepare_block_tables(seqs) if cu_seqlens_k[-1] > cu_seqlens_q[-1] else None
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)

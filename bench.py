@@ -83,7 +83,7 @@ def main():
         step_start = time.perf_counter()
         
         # 调用 step，解包返回值
-        scheduled_seqs, is_prefill, num_step_tokens = llm.step()
+        scheduled_seqs, prefill_count, decode_count = llm.step()
         
         step_end = time.perf_counter()
         step_latency = step_end - step_start
@@ -91,22 +91,25 @@ def main():
         if not scheduled_seqs:
             continue
 
-        # 统计吞吐量
-        if is_prefill:
+        if prefill_count > 0:
             prefill_time += step_latency
-            prefill_tokens += num_step_tokens
-        else:
+            prefill_tokens += prefill_count
+            
+        if decode_count > 0:
             decode_time += step_latency
-            actual_decode_tokens = -num_step_tokens
-            decode_tokens += actual_decode_tokens
-            if len(scheduled_seqs) > 0:
-                decode_latencies.append(step_latency / len(scheduled_seqs))
+            # 注意：Decode count 是生成的 token 数，即 batch size
+            decode_tokens += decode_count
+            
+            if decode_count > 0:
+                decode_latencies.append(step_latency)
 
         # 统计 TTFT
         for seq in scheduled_seqs:
             if seq.seq_id not in ttfts:
-                if seq.num_completion_tokens > 0 or not is_prefill:
-                    ttfts[seq.seq_id] = step_end - arrival_time
+                if seq.num_completion_tokens > 0: 
+                     ttfts[seq.seq_id] = step_end - arrival_time
+                elif prefill_count > 0 and seq in scheduled_seqs:
+                    pass
 
     total_end = time.perf_counter()
     total_duration = total_end - total_start
@@ -147,7 +150,7 @@ def main():
     }
 
     os.makedirs("./benchmark", exist_ok=True)
-    filename = f"bench_{datetime.now().strftime('%Y%m%d_%H%M%S')}_pd{args.pd}.json"
+    filename = f"bench_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     filepath = os.path.join("./benchmark", filename)
     
     with open(filepath, "w", encoding="utf-8") as f:
