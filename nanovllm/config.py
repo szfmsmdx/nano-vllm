@@ -10,7 +10,7 @@ class Config:
     max_num_seqs: int = 512
     max_model_len: int = 4096
     gpu_memory_utilization: float = 0.9
-    tensor_parallel_size: int = 2
+    tensor_parallel_size: int = 4
     enforce_eager: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1

@@ -73,7 +73,6 @@ class ModelRunner:
         #     self.model = Qwen3ForCausalLM(hf_config)
         self.model = model_dict[hf_config.model_type](hf_config)
         load_model(self.model, config.model)
-        load_model(self.model, config.model)
         self.sampler = Sampler()
         
         # 新增：传输专用流

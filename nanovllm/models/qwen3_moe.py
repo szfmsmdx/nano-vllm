@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
-from transformers import Qwen2MoeConfig
+from transformers import Qwen3MoeConfig
 
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
@@ -125,7 +125,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2MoeConfig,
+        config: Qwen3MoeConfig,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -191,7 +191,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2MoeConfig,
+        config: Qwen3MoeConfig,
         layer_idx: int = -1,
     ) -> None:
         super().__init__()
@@ -244,7 +244,7 @@ class Qwen3MoeModel(nn.Module):
 
     def __init__(
         self,
-        config: Qwen2MoeConfig,
+        config: Qwen3MoeConfig,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(
@@ -281,7 +281,7 @@ class Qwen3MoeForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config: Qwen2MoeConfig) -> None:
+    def __init__(self, config: Qwen3MoeConfig) -> None:
         super().__init__()
         self.model = Qwen3MoeModel(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
